@@ -30,8 +30,7 @@ import com.amazonaws.services.kinesis.clientlibrary.types.UserRecord;
  * 
  * This class is NOT thread-safe.
  * 
- * @see https://github.com/awslabs/amazon-kinesis-producer/blob/master/
- *      aggregation-format.md
+ * @see <a href="https://github.com/awslabs/amazon-kinesis-producer/blob/master/aggregation-format.md">https://github.com/awslabs/amazon-kinesis-producer/blob/master/aggregation-format.md</a>
  */
 @NotThreadSafe
 public class RecordAggregator {
@@ -73,8 +72,8 @@ public class RecordAggregator {
 
 	/**
 	 * @return The size of this aggregated record in bytes. This value is always
-	 *         less than the Kinesis-defined maximum size for a
-	 *         PutRecordRequest (i.e. 1MB as of 3/26/2016).
+	 *         less than the Kinesis-defined maximum size for a PutRecordRequest
+	 *         (i.e. 1MB as of 3/26/2016).
 	 */
 	public long getSizeBytes() {
 		return this.currentRecord.getSizeBytes();
@@ -145,27 +144,27 @@ public class RecordAggregator {
 		return out;
 	}
 
-    /**
-     * Add a new user record to this aggregated record (will trigger a callback
-     * via onRecordComplete if aggregated record is full).
-     *
-     * @param userRecord
-     *          The Kinesis user record to add to this aggregated record
-     * @param data
-     *            The record data of the record to add
-     * @return A AggRecord if this aggregated record is full and ready to be
-     *         transmitted or null otherwise.
-     */
-    public AggRecord addUserRecord(UserRecord userRecord) {
-        if(userRecord == null) {
-            throw new IllegalArgumentException("Input user record cannot be null.");
-        }
-        else if(!userRecord.getData().hasArray()) {
-            throw new IllegalStateException("The addUserRecord method only works for UserRecord objects whose data ByteBuffer " +
-                                            " has a backing byte[] available.");
-        }
-        return addUserRecord(userRecord.getPartitionKey(), userRecord.getExplicitHashKey(), userRecord.getData().array());
-    }
+	/**
+	 * Add a new user record to this aggregated record (will trigger a callback
+	 * via onRecordComplete if aggregated record is full).
+	 *
+	 * @param userRecord
+	 *            The Kinesis user record to add to this aggregated record
+	 * @return A AggRecord if this aggregated record is full and ready to be
+	 *         transmitted or null otherwise.
+	 * @throws Exception If the user record can't be added to the current agg record
+	 */
+	public AggRecord addUserRecord(UserRecord userRecord) throws Exception {
+		if (userRecord == null) {
+			throw new IllegalArgumentException("Input user record cannot be null.");
+		} else if (!userRecord.getData().hasArray()) {
+			throw new IllegalStateException(
+					"The addUserRecord method only works for UserRecord objects whose data ByteBuffer "
+							+ " has a backing byte[] available.");
+		}
+		return addUserRecord(userRecord.getPartitionKey(), userRecord.getExplicitHashKey(),
+				userRecord.getData().array());
+	}
 
 	/**
 	 * Add a new user record to this aggregated record (will trigger a callback
@@ -177,8 +176,9 @@ public class RecordAggregator {
 	 *            The record data of the record to add
 	 * @return A AggRecord if this aggregated record is full and ready to be
 	 *         transmitted or null otherwise.
+     * @throws Exception If the user record can't be added to the current agg record
 	 */
-	public AggRecord addUserRecord(String partitionKey, byte[] data) {
+	public AggRecord addUserRecord(String partitionKey, byte[] data) throws Exception {
 		return addUserRecord(partitionKey, null, data);
 	}
 
@@ -194,28 +194,35 @@ public class RecordAggregator {
 	 *            The record data of the record to add
 	 * @return A AggRecord if this aggregated record is full and ready to be
 	 *         transmitted or null otherwise.
+     * @throws Exception If the user record can't be added to the current agg record
 	 */
-	public AggRecord addUserRecord(String partitionKey, String explicitHashKey, byte[] data) {
+	public AggRecord addUserRecord(String partitionKey, String explicitHashKey, byte[] data) throws Exception {
 		boolean success = this.currentRecord.addUserRecord(partitionKey, explicitHashKey, data);
+
 		if (success) {
 			// we were able to add the current data to the in-flight record
 			return null;
+		} else {
+			// this record is full, let all the listeners know
+			final AggRecord completeRecord = this.currentRecord;
+			for (ListenerExecutorPair pair : this.listeners) {
+				pair.getExecutor().execute(() -> {
+					pair.getListener().recordComplete(completeRecord);
+				});
+			}
+
+			// current record is full; clear it out, make a new empty one and
+			// add the new user record
+			clearRecord();
+			success = this.currentRecord.addUserRecord(partitionKey, explicitHashKey, data);
+
+			if (!success) {
+				throw new Exception(String.format("Unable to add User Record %s, %s with data length %s", partitionKey,
+						explicitHashKey, data.length));
+			}
+
+			return completeRecord;
 		}
-
-		// this record is full, let all the listeners know
-		final AggRecord completeRecord = this.currentRecord;
-		for (ListenerExecutorPair pair : this.listeners) {
-			pair.getExecutor().execute(() -> {
-				pair.getListener().recordComplete(completeRecord);
-			});
-		}
-
-		// current record is full; clear it out, make a new empty one and add
-		// the new user record
-		clearRecord();
-		this.currentRecord.addUserRecord(partitionKey, explicitHashKey, data);
-
-		return completeRecord;
 	}
 
 	/**
