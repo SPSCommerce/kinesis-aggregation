@@ -45,6 +45,7 @@ def _create_user_record(ehks, pks, mr, r, sub_seq_num):
         'kinesis': {
             'kinesisSchemaVersion': r['kinesis']['kinesisSchemaVersion'],
             'sequenceNumber': r['kinesis']['sequenceNumber'],
+            'approximateArrivalTimestamp': r['kinesis'].get('approximateArrivalTimestamp'),
 
             # Fill in the new values
             'explicitHashKey': explicit_hash_key,
@@ -67,7 +68,35 @@ def _create_user_record(ehks, pks, mr, r, sub_seq_num):
     return new_record
 
 
-def _get_error_string(r, message_data, ehks, pks, ar):
+def _create_user_record_from_api(ehks, pks, mr, r, sub_seq_num):
+    """Given a protobuf message record, generate a new Kinesis user record
+
+    ehks - The list of explicit hash keys from the protobuf message (list of str)
+    pks - The list of partition keys from the protobuf message (list of str)
+    mr - A single deaggregated message record from the protobuf message (dict)
+    r - The original aggregated kinesis record containing the protobuf message record (dict)
+    sub_seq_num - The current subsequence number within the aggregated protobuf message (int)
+
+    return value - A Kinesis user record created from a message record in the protobuf message (dict)"""
+    explicit_hash_key = None
+    if ehks and ehks[mr.explicit_hash_key_index] is not None:
+        explicit_hash_key = ehks[mr.explicit_hash_key_index]
+    partition_key = pks[mr.partition_key_index]
+
+    new_record = {
+        'Data': mr.data,
+        'SequenceNumber': r['SequenceNumber'],
+        'ApproximateArrivalTimestamp': r.get('ApproximateArrivalTimestamp'),
+        'PartitionKey': partition_key,
+        'SubSequenceNumber': sub_seq_num,
+        'Aggregated': True,
+        'ExplicitHashKey': explicit_hash_key,
+    }
+
+    return new_record
+
+
+def _get_error_string(sequence_number, message_data, ehks, pks, ar):
     """Generate a detailed error message for when protobuf parsing fails.
 
     r - The original aggregated kinesis record containing the protobuf message record (dict)
@@ -95,7 +124,7 @@ def _get_error_string(r, message_data, ehks, pks, ar):
                             mr.partition_key_index,
                             len(mr.data)))
     error_buffer.write('Sequence number: %s\n' %
-                       (r['kinesis']['sequenceNumber']))
+                       (sequence_number))
     error_buffer.write('Raw data: %s\n' % (base64.b64encode(message_data)))
 
     return error_buffer.getvalue()
@@ -117,6 +146,12 @@ def deaggregate_records(records):
     return return_records
 
 
+def deaggregate_api_records(records):
+    return_records = []
+    return_records.extend(iter_deaggregate_api_records(records))
+    return return_records
+
+
 def iter_deaggregate_records(records):
     """Generator function - Given a set of Kinesis records, deaggregate them one at a time
     using the Kinesis aggregated message format.  This method will not affect any
@@ -131,66 +166,91 @@ def iter_deaggregate_records(records):
         records = [records]
 
     for r in records:
-        is_aggregated = True
-        sub_seq_num = 0
-
         # Decode the incoming data
-        raw_data = r['kinesis']['data']
-        decoded_data = base64.b64decode(raw_data)
-
-        # Verify the magic header
-        data_magic = None
-        if len(decoded_data) >= len(MAGIC):
-            data_magic = decoded_data[:len(MAGIC)]
-        else:
-            is_aggregated = False
-
-        decoded_data_no_magic = decoded_data[len(MAGIC):]
-
-        if MAGIC != data_magic or len(decoded_data_no_magic) <= DIGEST_SIZE:
-            is_aggregated = False
-
-        if is_aggregated:
-            # verify the MD5 digest
-            message_digest = decoded_data_no_magic[-DIGEST_SIZE:]
-            message_data = decoded_data_no_magic[:-DIGEST_SIZE]
-
-            md5_calc = hashlib.md5()
-            md5_calc.update(message_data)
-            calculated_digest = md5_calc.digest()
-
-            if message_digest != calculated_digest:
-                is_aggregated = False
-            else:
-                # Extract the protobuf message
-                try:
-                    ar = kpl_pb2.AggregatedRecord()
-                    ar.ParseFromString(message_data)
-
-                    pks = ar.partition_key_table
-                    ehks = ar.explicit_hash_key_table
-
-                    try:
-                        # Split out all the aggregated records into individual
-                        # records
-                        for mr in ar.records:
-                            new_record = _create_user_record(
-                                ehks, pks, mr, r, sub_seq_num)
-                            sub_seq_num += 1
-                            yield new_record
-
-                    except Exception as e:
-                        error_string = _get_error_string(
-                            r, message_data, ehks, pks, ar)
-                        print(
-                            'ERROR: %s\n%s' % (str(e), error_string),
-                            file=sys.stderr
-                        )
-
-                except google.protobuf.message.DecodeError:
-                    is_aggregated = False
-
-        if not is_aggregated:
-            yield r
+        for inner_r in iter_deaggregate_record(
+            r=r,
+            record_data_mapper=lambda _: base64.b64decode(_['kinesis']['data']),
+            user_record_mapper=_create_user_record
+        ):
+            yield inner_r
 
     return
+
+
+def iter_deaggregate_api_records(records):
+    if isinstance(records, collections.Mapping):
+        records = [records]
+
+    for r in records:
+        # Decode the incoming data
+        for inner_r in iter_deaggregate_record(
+            r=r,
+            record_data_mapper=lambda _: _['Data'],
+            user_record_mapper=_create_user_record_from_api
+        ):
+            yield inner_r
+
+    return
+
+
+def iter_deaggregate_record(r, record_data_mapper, user_record_mapper):
+    is_aggregated = True
+    sub_seq_num = 0
+
+    # Decode the incoming data
+    decoded_data = record_data_mapper(r)
+
+    # Verify the magic header
+    data_magic = None
+    if len(decoded_data) >= len(MAGIC):
+        data_magic = decoded_data[:len(MAGIC)]
+    else:
+        is_aggregated = False
+
+    decoded_data_no_magic = decoded_data[len(MAGIC):]
+
+    if MAGIC != data_magic or len(decoded_data_no_magic) <= DIGEST_SIZE:
+        is_aggregated = False
+
+    if is_aggregated:
+        # verify the MD5 digest
+        message_digest = decoded_data_no_magic[-DIGEST_SIZE:]
+        message_data = decoded_data_no_magic[:-DIGEST_SIZE]
+
+        md5_calc = hashlib.md5()
+        md5_calc.update(message_data)
+        calculated_digest = md5_calc.digest()
+
+        if message_digest != calculated_digest:
+            is_aggregated = False
+        else:
+            # Extract the protobuf message
+            try:
+                ar = kpl_pb2.AggregatedRecord()
+                ar.ParseFromString(message_data)
+
+                pks = ar.partition_key_table
+                ehks = ar.explicit_hash_key_table
+
+                try:
+                    # Split out all the aggregated records into individual
+                    # records
+                    for mr in ar.records:
+                        new_record = user_record_mapper(
+                            ehks, pks, mr, r, sub_seq_num)
+                        sub_seq_num += 1
+                        yield new_record
+
+                except Exception as e:
+                    error_string = _get_error_string(
+                        sub_seq_num, message_data, ehks, pks, ar)
+                    print(
+                        'ERROR: %s\n%s' % (str(e), error_string),
+                        file=sys.stderr
+                    )
+
+            except google.protobuf.message.DecodeError:
+                is_aggregated = False
+
+    if not is_aggregated:
+        yield r

@@ -42,12 +42,28 @@ def create_kinesis_lambda_record(pk, ehk, data):
                 "awsRegion": "us-east-1"}]}
 
 
-class TestEndToEnd(unittest.TestCase):
+def create_kinesis_api_record(pk, ehk, data):
 
-    def setUp(self):
+    return {
+        "Records": [
+            {
+                "PartitionKey": pk,
+                "Data": data,
+                "SequenceNumber": "49545115243490985018280067714973144582180062593244200961",
+            },
+        ]
+    }
+
+
+class EndToEndCases:
+
+    def output_data(self, record):
         pass
 
-    def tearDown(self):
+    def event(self, *args, **kwargs):
+        pass
+
+    def deaggregate(self, records):
         pass
 
     def test_single_user_record_as_str(self):
@@ -87,16 +103,14 @@ class TestEndToEnd(unittest.TestCase):
         # NOTE: intermediate_data is a fully aggregated record, not just the
         # raw input data at this point
 
-        event = create_kinesis_lambda_record(
+        event = self.event(
             intermediate_pk, intermediate_ehk, intermediate_data)
-        records = deagg.deaggregate_records(event['Records'])
+        records = self.deaggregate(event['Records'])
 
         self.assertEqual(1, len(records))
 
         record = records[0]
-        output_pk = record['kinesis']['partitionKey']
-        output_ehk = record['kinesis']['explicitHashKey']
-        output_data = base64.b64decode(record['kinesis']['data'])
+        output_pk, output_ehk, output_data = self.output_data(record)
 
         self.assertEqual(input_pk, output_pk,
                          'Input and output partition keys do not match.')
@@ -142,16 +156,14 @@ class TestEndToEnd(unittest.TestCase):
         # NOTE: intermediate_data is a fully aggregated record, not just the
         # raw input data at this point
 
-        event = create_kinesis_lambda_record(
+        event = self.event(
             intermediate_pk, intermediate_ehk, intermediate_data)
-        records = deagg.deaggregate_records(event['Records'])
+        records = self.deaggregate(event['Records'])
 
         self.assertEqual(1, len(records))
 
         record = records[0]
-        output_pk = record['kinesis']['partitionKey']
-        output_ehk = record['kinesis']['explicitHashKey']
-        output_data = base64.b64decode(record['kinesis']['data'])
+        output_pk, output_ehk, output_data = self.output_data(record)
 
         self.assertEqual(input_pk, output_pk,
                          'Input and output partition keys do not match.')
@@ -159,3 +171,35 @@ class TestEndToEnd(unittest.TestCase):
                          'Intermediate and output EHK do not match.')
         self.assertEqual(input_data, output_data,
                          'Input and output record data does not match.')
+
+
+class TestEndToEnd(EndToEndCases, unittest.TestCase):
+
+    def output_data(self, record):
+        output_pk = record['kinesis']['partitionKey']
+        output_ehk = record['kinesis']['explicitHashKey']
+        output_data = base64.b64decode(record['kinesis']['data'])
+
+        return output_pk, output_ehk, output_data
+
+    def event(self, *args, **kwargs):
+        return create_kinesis_lambda_record(*args, **kwargs)
+
+    def deaggregate(self, records):
+        return deagg.deaggregate_records(records)
+
+
+class TestEndToEndApi(EndToEndCases, unittest.TestCase):
+
+    def output_data(self, record):
+        output_pk = record['PartitionKey']
+        output_ehk = record['ExplicitHashKey']
+        output_data = record['Data']
+
+        return output_pk, output_ehk, output_data
+
+    def event(self, *args, **kwargs):
+        return create_kinesis_api_record(*args, **kwargs)
+
+    def deaggregate(self, records):
+        return deagg.deaggregate_api_records(records)
